@@ -1,0 +1,525 @@
+---
+title: "P8106 Midterm Project"
+author: "Chenxi Liu, Haoyi Tan,Haochen Yu"
+date: "2026-03-29"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# 1. Overview
+
+This analysis treats `log_PFS` as a continuous outcome and compares several candidate prediction models on the 1990--1995 cohort (`datA`). Model development and tuning are performed entirely within `datA` using repeated 10-fold cross-validation. The final model selected from `datA` is then externally validated on the 2000--2005 cohort (`datB`). If the selected model does not generalize well, the same candidate-model framework is refit in `datB`.
+
+# 2. Data Loading and Preprocessing
+
+```{r data_prep}
+library(glmnet)
+library(caret)
+library(splines)
+library(ggplot2)
+library(corrplot)
+library(earth)
+library(mgcv)
+library(gam)
+library(mgcv)
+library(dplyr)
+library(tidyr)
+library(gridExtra)
+
+set.seed(2026)
+
+# Load datasets
+load("datA.RData")
+load("datB.RData")
+
+# Function to convert categorical variables to factors
+convert_factors <- function(df) {
+  df$menopause <- factor(df$menopause, levels = c(0,1), labels = c("Pre","Post"))
+  df$race <- factor(df$race, levels = 1:4, labels = c("White","Black","Asian","Hispanic"))
+  df$ER <- factor(df$ER, levels = c(0,1), labels = c("Negative","Positive"))
+  df$PR <- factor(df$PR, levels = c(0,1), labels = c("Negative","Positive"))
+  df$HER2 <- factor(df$HER2, levels = c(0,1), labels = c("Negative","Positive"))
+  df$tumor_grade <- factor(df$tumor_grade, levels = 1:3, labels = c("Well","Moderate","Poor"))
+  df$stage <- factor(df$stage, levels = 1:3, labels = c("I","II","III"))
+  df$surgery <- factor(df$surgery, levels = c(0,1), labels = c("BCS","Mastectomy"))
+  df$chemo <- factor(df$chemo, levels = c(0,1), labels = c("No","Yes"))
+  df$hormonal_therapy <- factor(df$hormonal_therapy, levels = c(0,1), labels = c("No","Yes"))
+  return(df)
+}
+
+datA_f <- convert_factors(datA)
+datB_f <- convert_factors(datB)
+
+# Remove ID column as it is not a predictor
+datA_f$id <- NULL
+datB_f$id <- NULL
+
+# Check missingness, then use complete-case analysis if needed
+cat("=== Missing values in datA ===\n")
+print(colSums(is.na(datA_f)))
+cat("\n=== Missing values in datB ===\n")
+print(colSums(is.na(datB_f)))
+
+nA_before <- nrow(datA_f)
+nB_before <- nrow(datB_f)
+datA_f <- na.omit(datA_f)
+datB_f <- na.omit(datB_f)
+cat("\ndatA rows before/after na.omit:", nA_before, nrow(datA_f), "\n")
+cat("datB rows before/after na.omit:", nB_before, nrow(datB_f), "\n")
+
+# Summary statistics
+cat("\n=== datA Summary ===\n")
+str(datA_f)
+summary(datA_f$log_PFS)
+
+cat("\n=== datB Summary ===\n")
+str(datB_f)
+summary(datB_f$log_PFS)
+```
+
+# 3. Exploratory Data Analysis
+
+```{r eda, fig.width=8, fig.height=5}
+# Distribution of log_PFS
+par(mfrow = c(1, 2))
+hist(datA_f$log_PFS, breaks = 30, main = "Distribution of log(PFS) - datA",
+     xlab = "log(PFS)", col = "lightblue", border = "white")
+hist(datB_f$log_PFS, breaks = 30, main = "Distribution of log(PFS) - datB",
+     xlab = "log(PFS)", col = "lightgreen", border = "white")
+par(mfrow = c(1, 1))
+
+# Correlation plot for numeric variables
+numeric_vars <- datA_f[, c("age", "bmi", "tumor_size", "lymph_nodes", "Ki67", "log_PFS")]
+corrplot(cor(numeric_vars), method = "color", type = "upper",
+         addCoef.col = "black", tl.col = "black", tl.srt = 45,
+         title = "Correlation Matrix (datA)", mar = c(0,0,1,0))
+```
+
+# 4. Candidate Models and Tuning Grids
+
+The following models are considered:
+
+- OLS (baseline)
+- Linear regression with natural cubic splines
+- GAM
+- Ridge regression
+- Lasso regression
+- Elastic net
+- PCR
+- PLS
+- MARS
+
+RMSE is used as the primary model-selection criterion in `datA`. MAE and R-squared are also reported for external validation in `datB`.
+
+```{r tuning_grids}
+# Set up cross-validation: 10-fold CV repeated 5 times
+ctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 5)
+
+# Prepare model matrix
+x_A <- model.matrix(log_PFS ~ ., data = datA_f)[, -1]
+y_A <- datA_f$log_PFS
+x_B_raw <- model.matrix(log_PFS ~ ., data = datB_f)[, -1]
+y_B <- datB_f$log_PFS
+
+# Align datB model matrix columns to datA model matrix columns
+missing_cols <- setdiff(colnames(x_A), colnames(x_B_raw))
+if (length(missing_cols) > 0) {
+  x_B_raw <- cbind(x_B_raw,
+                   matrix(0, nrow = nrow(x_B_raw), ncol = length(missing_cols),
+                          dimnames = list(NULL, missing_cols)))
+}
+extra_cols <- setdiff(colnames(x_B_raw), colnames(x_A))
+if (length(extra_cols) > 0) {
+  x_B_raw <- x_B_raw[, setdiff(colnames(x_B_raw), extra_cols), drop = FALSE]
+}
+x_B <- x_B_raw[, colnames(x_A), drop = FALSE]
+
+# Unified tuning grids for penalized models
+lambda_grid <- 10^seq(-3, 1, length = 100)
+ridge_grid <- expand.grid(alpha = 0, lambda = lambda_grid)
+lasso_grid <- expand.grid(alpha = 1, lambda = lambda_grid)
+enet_grid  <- expand.grid(alpha = c(0.25, 0.50, 0.75), lambda = lambda_grid)
+mars_grid  <- expand.grid(degree = 1:2, nprune = seq(5, 25, by = 5))
+
+# Formulas for interpretable models
+formula_ols <- log_PFS ~ .
+formula_spline <- log_PFS ~ 
+  ns(age, df = 3) + menopause + race + ns(bmi, df = 3) +
+  ns(tumor_size, df = 3) + tumor_grade + ns(lymph_nodes, df = 3) +
+  ER + PR + HER2 + ns(Ki67, df = 3) + stage + surgery + chemo +
+  hormonal_therapy
+
+# GAM allows flexible nonlinear effects for continuous predictors
+formula_gam <- log_PFS ~ 
+  s(age) + menopause + race + s(bmi) + s(tumor_size) + tumor_grade +
+  s(lymph_nodes) + ER + PR + HER2 + s(Ki67) + stage + surgery +
+  chemo + hormonal_therapy
+
+tuning_table <- data.frame(
+  Model = c("OLS", "Spline LM", "GAM", "Ridge", "Lasso", "Elastic Net", "PCR", "PLS", "MARS"),
+  Tuning_Parameters = c(
+    "None",
+    "Natural spline df fixed at 3 for each continuous predictor",
+    "Smoothing parameters estimated automatically by the fitting procedure",
+    "lambda",
+    "lambda",
+    "alpha and lambda",
+    "ncomp",
+    "ncomp",
+    "degree and nprune"
+  ),
+  Grid = c(
+    "None",
+    "df = 3 (prespecified)",
+    "Automatic smoothing selection",
+    "lambda = 10^seq(-3, 1, length = 100)",
+    "lambda = 10^seq(-3, 1, length = 100)",
+    "alpha = {0.25, 0.50, 0.75}; lambda = 10^seq(-3, 1, length = 100)",
+    paste0("ncomp = 1:", ncol(x_A)),
+    paste0("ncomp = 1:", min(20, ncol(x_A))),
+    "degree = {1,2}; nprune = {5,10,15,20,25}"
+  )
+)
+knitr::kable(tuning_table, caption = "Candidate models and tuning grids")
+```
+
+# 5. Part I: Model Training on 1990-1995 Cohort (datA)
+
+```{r model_training, cache=TRUE}
+# 1. OLS
+# OLS remains the baseline linear model
+ols_fit <- train(formula_ols, data = datA_f, method = "lm", trControl = ctrl)
+
+# 2. Linear regression with natural cubic splines
+# Splines allow flexible but still regression-based nonlinear effects
+spline_fit <- train(formula_spline, data = datA_f, method = "lm", trControl = ctrl)
+
+# 3. GAM
+# GAM allows flexible nonlinear effects for continuous predictors
+# Use mgcv::gam directly because caret::train(method = "gam") can be unstable across environments
+gam_fit <- mgcv::gam(formula_gam, data = datA_f, method = "REML")
+
+# Manual repeated 10-fold CV for GAM to make its evaluation comparable to other models
+set.seed(123)
+gam_folds_A <- caret::createMultiFolds(y_A, k = 10, times = 5)
+gam_pred_A <- vector("list", length(gam_folds_A))
+gam_obs_A  <- vector("list", length(gam_folds_A))
+
+for (i in seq_along(gam_folds_A)) {
+  train_idx <- gam_folds_A[[i]]
+  test_idx  <- setdiff(seq_len(nrow(datA_f)), train_idx)
+  fit_i <- mgcv::gam(formula_gam, data = datA_f[train_idx, , drop = FALSE], method = "REML")
+  pred_i <- predict(fit_i, newdata = datA_f[test_idx, , drop = FALSE])
+  gam_pred_A[[i]] <- pred_i
+  gam_obs_A[[i]]  <- datA_f$log_PFS[test_idx]
+}
+
+gam_pred_vec_A <- unlist(gam_pred_A)
+gam_obs_vec_A  <- unlist(gam_obs_A)
+gam_results <- data.frame(
+  RMSE = sqrt(mean((gam_obs_vec_A - gam_pred_vec_A)^2)),
+  Rsquared = 1 - sum((gam_obs_vec_A - gam_pred_vec_A)^2) / sum((gam_obs_vec_A - mean(gam_obs_vec_A))^2),
+  MAE = mean(abs(gam_obs_vec_A - gam_pred_vec_A))
+)
+cat("GAM CV RMSE:", gam_results$RMSE, "\n")
+
+# 4. Ridge Regression
+ridge_fit <- train(x = x_A, y = y_A, method = "glmnet",
+                   tuneGrid = ridge_grid, trControl = ctrl,
+                   standardize = TRUE)
+cat("Best Ridge lambda:", ridge_fit$bestTune$lambda, "\n")
+
+# 5. Lasso Regression
+lasso_fit <- train(x = x_A, y = y_A, method = "glmnet",
+                   tuneGrid = lasso_grid, trControl = ctrl,
+                   standardize = TRUE)
+cat("Best Lasso lambda:", lasso_fit$bestTune$lambda, "\n")
+
+# 6. Elastic Net
+enet_fit <- train(x = x_A, y = y_A, method = "glmnet",
+                  tuneGrid = enet_grid, trControl = ctrl,
+                  standardize = TRUE)
+cat("Best Elastic Net alpha:", enet_fit$bestTune$alpha, 
+    "lambda:", enet_fit$bestTune$lambda, "\n")
+
+# 7. PCR
+pcr_fit <- train(x = x_A, y = y_A, method = "pcr",
+                 tuneGrid = data.frame(ncomp = 1:ncol(x_A)),
+                 trControl = ctrl, preProcess = c("center", "scale"))
+cat("Best PCR ncomp:", pcr_fit$bestTune$ncomp, "\n")
+
+# 8. PLS
+pls_fit <- train(x = x_A, y = y_A, method = "pls",
+                 tuneGrid = data.frame(ncomp = 1:min(20, ncol(x_A))),
+                 trControl = ctrl, preProcess = c("center", "scale"))
+cat("Best PLS ncomp:", pls_fit$bestTune$ncomp, "\n")
+
+# 9. MARS
+mars_fit <- train(x = x_A, y = y_A, method = "earth",
+                  tuneGrid = mars_grid, trControl = ctrl)
+cat("Best MARS degree:", mars_fit$bestTune$degree, 
+    "nprune:", mars_fit$bestTune$nprune, "\n")
+```
+
+# 6. Model Comparison and Selection
+
+```{r model_comparison, fig.width=10, fig.height=6}
+# Resamples comparison
+resamp <- resamples(list(
+  OLS = ols_fit,
+  Spline = spline_fit,
+  Ridge = ridge_fit,
+  Lasso = lasso_fit,
+  ElasticNet = enet_fit,
+  PCR = pcr_fit,
+  PLS = pls_fit,
+  MARS = mars_fit
+))
+
+# Summary
+resamp_summary <- summary(resamp)
+resamp_summary
+
+# Figure 1: CV RMSE boxplot comparison
+bwplot(resamp, metric = "RMSE", main = "Cross-Validation RMSE Comparison (caret models)")
+cat("\nNote: GAM was fit with mgcv::gam and evaluated by manual repeated 10-fold CV; its RMSE is reported in the summary table below.\n")
+```
+
+```{r final_model_selection}
+# Collect the best resampling result for each model
+cv_results <- bind_rows(
+  ols_fit$results %>% mutate(Model = "OLS"),
+  spline_fit$results %>% mutate(Model = "Spline"),
+  gam_results %>% mutate(Model = "GAM"),
+  ridge_fit$results %>% filter(alpha == ridge_fit$bestTune$alpha,
+                               lambda == ridge_fit$bestTune$lambda) %>% mutate(Model = "Ridge"),
+  lasso_fit$results %>% filter(alpha == lasso_fit$bestTune$alpha,
+                               lambda == lasso_fit$bestTune$lambda) %>% mutate(Model = "Lasso"),
+  enet_fit$results %>% filter(alpha == enet_fit$bestTune$alpha,
+                              lambda == enet_fit$bestTune$lambda) %>% mutate(Model = "ElasticNet"),
+  pcr_fit$results %>% filter(ncomp == pcr_fit$bestTune$ncomp) %>% mutate(Model = "PCR"),
+  pls_fit$results %>% filter(ncomp == pls_fit$bestTune$ncomp) %>% mutate(Model = "PLS"),
+  mars_fit$results %>% filter(degree == mars_fit$bestTune$degree,
+                              nprune == mars_fit$bestTune$nprune) %>% mutate(Model = "MARS")
+) %>%
+  select(Model, RMSE, Rsquared, MAE, everything()) %>%
+  arrange(RMSE)
+
+knitr::kable(cv_results[, c("Model", "RMSE", "Rsquared", "MAE")],
+             digits = 4,
+             caption = "Cross-validated performance on datA (ranked by RMSE)")
+
+best_model_name <- cv_results$Model[1]
+cat("Final model selected from datA:", best_model_name, "\n")
+
+# Model list for downstream prediction
+models <- list(
+  OLS = ols_fit,
+  Spline = spline_fit,
+  GAM = gam_fit,
+  Ridge = ridge_fit,
+  Lasso = lasso_fit,
+  ElasticNet = enet_fit,
+  PCR = pcr_fit,
+  PLS = pls_fit,
+  MARS = mars_fit
+)
+final_model <- models[[best_model_name]]
+```
+
+```{r interpretation_outputs, fig.width=10, fig.height=4}
+# Baseline OLS model for interpretation
+ols_interpret <- lm(formula_ols, data = datA_f)
+summary(ols_interpret)
+
+# OLS diagnostic plots
+par(mfrow = c(1, 2))
+plot(ols_interpret, which = 1)
+plot(ols_interpret, which = 2)
+par(mfrow = c(1, 1))
+
+# Lasso coefficient path and coefficients (useful for interpretation if penalized methods perform well)
+cat("\n=== Lasso Coefficients ===\n")
+lasso_coef <- coef(lasso_fit$finalModel, lasso_fit$bestTune$lambda)
+print(lasso_coef)
+
+plot(lasso_fit$finalModel, xvar = "lambda", label = TRUE,
+     main = "Lasso Coefficient Path")
+```
+
+# 7. Part II: Generalization to 2000-2005 Cohort (datB)
+
+```{r generalization}
+# Function to calculate metrics
+calc_metrics <- function(actual, predicted) {
+  rmse <- sqrt(mean((actual - predicted)^2))
+  mae <- mean(abs(actual - predicted))
+  rsq <- 1 - sum((actual - predicted)^2) / sum((actual - mean(actual))^2)
+  return(c(RMSE = rmse, MAE = mae, Rsquared = rsq))
+}
+
+# Prediction helper: formula-based models use datB_f, matrix-based models use x_B
+predict_from_model <- function(name, model_object, datB_f, x_B) {
+  if (name %in% c("OLS", "Spline", "GAM")) {
+    predict(model_object, newdata = datB_f)
+  } else {
+    predict(model_object, newdata = x_B)
+  }
+}
+
+# External validation of the final model selected from datA
+pred_B_final <- predict_from_model(best_model_name, final_model, datB_f, x_B)
+final_metrics_B <- calc_metrics(y_B, pred_B_final)
+
+final_validation <- data.frame(
+  Model = best_model_name,
+  RMSE = final_metrics_B["RMSE"],
+  MAE = final_metrics_B["MAE"],
+  Rsquared = final_metrics_B["Rsquared"]
+)
+cat("=== External validation of final datA model on datB ===\n")
+print(final_validation, row.names = FALSE)
+
+# Calibration assessment
+calibration_fit <- lm(y_B ~ pred_B_final)
+cat("\n=== Calibration model for final datA model on datB ===\n")
+summary(calibration_fit)
+```
+
+```{r generalization_plots, fig.width=10, fig.height=5}
+# Optional: external validation results for all datA models
+all_external_results <- data.frame()
+for (name in names(models)) {
+  pred <- predict_from_model(name, models[[name]], datB_f, x_B)
+  metrics <- calc_metrics(y_B, pred)
+  all_external_results <- rbind(all_external_results,
+                                data.frame(Model = name,
+                                           RMSE = metrics["RMSE"],
+                                           MAE = metrics["MAE"],
+                                           Rsquared = metrics["Rsquared"]))
+}
+all_external_results <- all_external_results[order(all_external_results$RMSE), ]
+cat("\n=== External validation results for all datA models on datB ===\n")
+print(all_external_results, row.names = FALSE)
+
+# Figure 3: Predicted vs Actual for final model
+par(mfrow = c(1, 2))
+plot(pred_B_final, y_B, pch = 20, col = rgb(0, 0, 1, 0.3),
+     xlab = "Predicted log(PFS)", ylab = "Observed log(PFS)",
+     main = paste0(best_model_name, ": Predicted vs Observed (datB)"))
+abline(0, 1, col = "red", lwd = 2)
+
+plot(pred_B_final, y_B - pred_B_final, pch = 20, col = rgb(0, 0.5, 0, 0.3),
+     xlab = "Predicted log(PFS)", ylab = "Residuals",
+     main = paste0(best_model_name, ": Residuals (datB)"))
+abline(h = 0, col = "red", lwd = 2)
+par(mfrow = c(1, 1))
+```
+
+# 8. Building New Model on datB
+
+```{r new_model_datB, cache=TRUE}
+ctrl_B <- trainControl(method = "repeatedcv", number = 10, repeats = 5)
+
+# Refit the same candidate-model set on datB
+ols_fit_B <- train(formula_ols, data = datB_f, method = "lm", trControl = ctrl_B)
+spline_fit_B <- train(formula_spline, data = datB_f, method = "lm", trControl = ctrl_B)
+# Refit GAM on datB using mgcv::gam and evaluate it by manual repeated 10-fold CV
+gam_fit_B <- mgcv::gam(formula_gam, data = datB_f, method = "REML")
+
+set.seed(123)
+gam_folds_B <- caret::createMultiFolds(y_B, k = 10, times = 5)
+gam_pred_B_cv <- vector("list", length(gam_folds_B))
+gam_obs_B_cv  <- vector("list", length(gam_folds_B))
+
+for (i in seq_along(gam_folds_B)) {
+  train_idx <- gam_folds_B[[i]]
+  test_idx  <- setdiff(seq_len(nrow(datB_f)), train_idx)
+  fit_i <- mgcv::gam(formula_gam, data = datB_f[train_idx, , drop = FALSE], method = "REML")
+  pred_i <- predict(fit_i, newdata = datB_f[test_idx, , drop = FALSE])
+  gam_pred_B_cv[[i]] <- pred_i
+  gam_obs_B_cv[[i]]  <- datB_f$log_PFS[test_idx]
+}
+
+gam_pred_vec_B <- unlist(gam_pred_B_cv)
+gam_obs_vec_B  <- unlist(gam_obs_B_cv)
+gam_results_B <- data.frame(
+  RMSE = sqrt(mean((gam_obs_vec_B - gam_pred_vec_B)^2)),
+  Rsquared = 1 - sum((gam_obs_vec_B - gam_pred_vec_B)^2) / sum((gam_obs_vec_B - mean(gam_obs_vec_B))^2),
+  MAE = mean(abs(gam_obs_vec_B - gam_pred_vec_B))
+)
+
+ridge_fit_B <- train(x = x_B, y = y_B, method = "glmnet",
+                     tuneGrid = ridge_grid, trControl = ctrl_B,
+                     standardize = TRUE)
+lasso_fit_B <- train(x = x_B, y = y_B, method = "glmnet",
+                     tuneGrid = lasso_grid, trControl = ctrl_B,
+                     standardize = TRUE)
+enet_fit_B <- train(x = x_B, y = y_B, method = "glmnet",
+                    tuneGrid = enet_grid, trControl = ctrl_B,
+                    standardize = TRUE)
+pcr_fit_B <- train(x = x_B, y = y_B, method = "pcr",
+                   tuneGrid = data.frame(ncomp = 1:ncol(x_B)),
+                   trControl = ctrl_B, preProcess = c("center", "scale"))
+pls_fit_B <- train(x = x_B, y = y_B, method = "pls",
+                   tuneGrid = data.frame(ncomp = 1:min(20, ncol(x_B))),
+                   trControl = ctrl_B, preProcess = c("center", "scale"))
+mars_fit_B <- train(x = x_B, y = y_B, method = "earth",
+                    tuneGrid = mars_grid, trControl = ctrl_B)
+```
+
+```{r new_model_datB_compare, fig.width=10, fig.height=6}
+cv_results_B <- bind_rows(
+  ols_fit_B$results %>% mutate(Model = "OLS"),
+  spline_fit_B$results %>% mutate(Model = "Spline"),
+  gam_results_B %>% mutate(Model = "GAM"),
+  ridge_fit_B$results %>% filter(alpha == ridge_fit_B$bestTune$alpha,
+                                 lambda == ridge_fit_B$bestTune$lambda) %>% mutate(Model = "Ridge"),
+  lasso_fit_B$results %>% filter(alpha == lasso_fit_B$bestTune$alpha,
+                                 lambda == lasso_fit_B$bestTune$lambda) %>% mutate(Model = "Lasso"),
+  enet_fit_B$results %>% filter(alpha == enet_fit_B$bestTune$alpha,
+                                lambda == enet_fit_B$bestTune$lambda) %>% mutate(Model = "ElasticNet"),
+  pcr_fit_B$results %>% filter(ncomp == pcr_fit_B$bestTune$ncomp) %>% mutate(Model = "PCR"),
+  pls_fit_B$results %>% filter(ncomp == pls_fit_B$bestTune$ncomp) %>% mutate(Model = "PLS"),
+  mars_fit_B$results %>% filter(degree == mars_fit_B$bestTune$degree,
+                                nprune == mars_fit_B$bestTune$nprune) %>% mutate(Model = "MARS")
+) %>%
+  select(Model, RMSE, Rsquared, MAE, everything()) %>%
+  arrange(RMSE)
+
+knitr::kable(cv_results_B[, c("Model", "RMSE", "Rsquared", "MAE")],
+             digits = 4,
+             caption = "Cross-validated performance on datB after refitting")
+
+best_model_name_B <- cv_results_B$Model[1]
+cat("Best refit model on datB:", best_model_name_B, "\n")
+```
+
+```{r coefficient_comparison, fig.width=10, fig.height=7}
+# Coefficient comparison for lasso as an example of how selected effects may change over time
+coef_A_lasso <- as.matrix(coef(lasso_fit$finalModel, s = lasso_fit$bestTune$lambda))
+coef_B_lasso <- as.matrix(coef(lasso_fit_B$finalModel, s = lasso_fit_B$bestTune$lambda))
+common_vars <- intersect(rownames(coef_A_lasso), rownames(coef_B_lasso))
+coef_compare <- data.frame(
+  Variable = common_vars[common_vars != "(Intercept)"],
+  datA = coef_A_lasso[common_vars[common_vars != "(Intercept)"], 1],
+  datB = coef_B_lasso[common_vars[common_vars != "(Intercept)"], 1]
+)
+
+coef_long <- pivot_longer(coef_compare,
+                          cols = c(datA, datB),
+                          names_to = "Dataset",
+                          values_to = "Coefficient")
+
+ggplot(coef_long, aes(x = Coefficient, y = reorder(Variable, abs(Coefficient)), fill = Dataset)) +
+  geom_col(position = "dodge") +
+  labs(title = "Lasso coefficients: datA versus datB",
+       x = "Coefficient", y = "Variable")
+```
